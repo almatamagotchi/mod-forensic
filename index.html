@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>mod-forensic — .mod file analyzer</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;padding:2rem;max-width:860px;margin:0 auto}
+  h1{font-size:1.5rem;margin-bottom:.25rem;color:#58a6ff}
+  p.sub{color:#8b949e;font-size:.85rem;margin-bottom:1.5rem}
+  .drop-zone{border:2px dashed #30363d;border-radius:8px;padding:3rem 1rem;text-align:center;cursor:pointer;margin-bottom:1.5rem;transition:border-color .2s}
+  .drop-zone:hover,.drop-zone.drag{border-color:#58a6ff}
+  .drop-zone p{color:#8b949e;font-size:.9rem}
+  .drop-zone .icon{font-size:2rem;margin-bottom:.5rem}
+  input[type=file]{display:none}
+  .section{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:1.25rem;margin-bottom:1rem}
+  .section h2{font-size:1rem;color:#c9d1d9;margin-bottom:.75rem;padding-bottom:.5rem;border-bottom:1px solid #21262d}
+  .section h3{font-size:.85rem;color:#8b949e;margin:1rem 0 .5rem}
+  table{width:100%;border-collapse:collapse;font-size:.82rem}
+  th,td{padding:.4rem .6rem;text-align:right;border-top:1px solid #21262d}
+  th{color:#8b949e;font-weight:600;text-align:right}
+  td{color:#c9d1d9}
+  td:first-child,th:first-child{text-align:left}
+  .kv{display:flex;flex-wrap:wrap;gap:.75rem 2rem;font-size:.85rem}
+  .kv dt{color:#8b949e}
+  .kv dd{color:#c9d1d9;font-weight:500}
+  .issue{background:#2d1218;border:1px solid #f85149;border-radius:4px;padding:.5rem .75rem;margin:.25rem 0;color:#f85149;font-size:.82rem}
+  .issue.warn{background:#1a1a10;border-color:#d29922;color:#d29922}
+  .issue.info{background:#0d1d2d;border-color:#58a6ff;color:#79c0ff}
+  .ok{color:#3fb950}
+  .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:.25rem}
+  .bar-fill{height:100%;border-radius:3px;transition:width .3s}
+  .hidden{display:none}
+  footer{text-align:center;color:#484f58;font-size:.75rem;margin-top:3rem}
+  footer a{color:#58a6ff;text-decoration:none}
+</style>
+</head>
+<body>
+
+<h1>mod-forensic</h1>
+<p class="sub">drop a .mod file to analyze its structure, samples, patterns, and issues</p>
+
+<div class="drop-zone" id="dropZone">
+  <div class="icon">📁</div>
+  <p>drop a .mod file here or click to browse</p>
+  <input type="file" id="fileInput" accept=".mod,.MOD">
+</div>
+
+<div id="report" class="hidden"></div>
+
+<footer>
+  <p>built by <a href="https://github.com/almatamagotchi">alma tamagotchi</a> · <a href="https://github.com/almatamagotchi/mod-forensic">mod-forensic</a></p>
+</footer>
+
+<script>
+// ============================================================
+// .mod format parser (JavaScript port)
+// ============================================================
+
+const NOTE_NAMES = ['C-','C#','D-','D#','E-','F-','F#','G-','G#','A-','A#','B-'];
+const EFFECT_NAMES = {
+  0x0:'Arpeggio',0x1:'Porta Up',0x2:'Porta Down',0x3:'Tone Porta',0x4:'Vibrato',
+  0x5:'Vol Slide+Tone Porta',0x6:'Vol Slide+Vibrato',0x7:'Tremolo',
+  0x8:'Set Panning',0x9:'Sample Offset',0xA:'Volume Slide',0xB:'Position Jump',
+  0xC:'Set Volume',0xD:'Pattern Break',0xE:'Extended',0xF:'Set Speed'
+};
+const EXTENDED_NAMES = {
+  0x0:'Filter Off',0x1:'Filter On',0x2:'Fine Porta Down',0x3:'Fine Porta Up',
+  0x4:'Set Vibrato Wave',0x5:'Set Fine Tune',0x6:'Pattern Loop',0x7:'Set Tremolo Wave',
+  0x8:'Set Panning',0x9:'Retrig Note',0xA:'Fine Vol Slide Up',0xB:'Fine Vol Slide Down',
+  0xC:'Note Cut',0xD:'Note Delay',0xE:'Pattern Delay',0xF:'Invert Loop'
+};
+
+function readBE16(buf, off) { return (buf[off]<<8)|buf[off+1]; }
+function noteName(period) {
+  if (!period || period===0) return '---';
+  const semitones = Math.round(12*Math.log2(428/(period*0.001935)));
+  const oct = Math.floor(semitones/12)+2;
+  const n = ((semitones%12)+12)%12;
+  return NOTE_NAMES[n]+oct;
+}
+
+function parseMod(bytes) {
+  const issues = [];
+  let off = 0;
+  const name = String.fromCharCode(...bytes.slice(0,20)).replace(/\0/g,'').trim()||'(untitled)';
+  off = 20;
+
+  // instruments
+  const instruments = [];
+  for (let i=0;i<31;i++) {
+    const insName = String.fromCharCode(...bytes.slice(off+0,off+22)).replace(/\0/g,'').trim();
+    const insLen = readBE16(bytes, off+22)*2; // word count
+    const finetune = (bytes[off+24]&0xF);
+    if (finetune >= 8) {} // signed nibble handling
+    const volume = bytes[off+25]&0x7F;
+    const loopStart = readBE16(bytes, off+26)*2;
+    const loopLength = readBE16(bytes, off+28)*2;
+
+    // sample data offset is computed later
+    instruments.push({ index:i, name:insName, length:insLen, finetune,
+      volume, loopStart, loopLength, sampleData:null, sampleOff:0 });
+    off += 30;
+  }
+
+  // song length & positions
+  const songLength = bytes[off]; off++;
+  if (songLength > 128) issues.push({sev:'error',text:'Song length > 128: '+songLength});
+  // skip restart byte
+  off++; // restart (unused in most mods)
+  const positions = Array.from(bytes.slice(off, off+128));
+  off += 128;
+
+  // marker
+  const marker = String.fromCharCode(...bytes.slice(off,off+4));
+  off += 4;
+  if (marker !== 'M.K.' && marker !== 'M!K!' && marker !== 'FLT4' && marker !== 'FLT8') {
+    issues.push({sev:'warn',text:'Marker: '+marker+' (expected M.K. or M!K!)'});
+  }
+  const numChannels = (marker==='M.K.'||marker==='M!K!') ? 4 : (marker==='FLT4'?4:8);
+
+  const numPatterns = Math.max(...positions)+1;
+  if (numPatterns > 128) issues.push({sev:'error',text:'Pattern count > 128: '+numPatterns});
+
+  // read patterns
+  const patternSize = 64*4*numChannels;
+  const patterns = [];
+  for (let p=0;p<numPatterns;p++) {
+    const pat = { index:p, notes:[], channelCounts:new Array(numChannels).fill(0),
+      channelEffects: new Array(numChannels).fill(0), effectSet:new Set() };
+    for (let row=0;row<64;row++) {
+      for (let ch=0;ch<numChannels;ch++) {
+        const b0 = bytes[off], b1 = bytes[off+1], b2 = bytes[off+2], b3 = bytes[off+3];
+        const sampleNum = (b0&0xF0)|((b2&0xF0)>>4);
+        const period = ((b0&0x0F)<<8)|b1;
+        const effect = b2&0x0F;
+        const param = b3;
+        if (sampleNum>0 || period>0 || effect>0 || param>0) {
+          pat.channelCounts[ch]++;
+          if (effect>0) { pat.channelEffects[ch]++; pat.effectSet.add(effect); }
+          pat.notes.push({row,ch,sample:sampleNum,period,effect,param});
+        }
+        off += 4;
+      }
+    }
+    patterns.push(pat);
+  }
+
+  // sample data
+  let sampleOff = off;
+  for (const ins of instruments) {
+    ins.sampleOff = sampleOff;
+    if (ins.length > 0 && sampleOff+ins.length <= bytes.length) {
+      const raw = bytes.slice(sampleOff, sampleOff+ins.length);
+      ins.sampleData = raw;
+      let min=127,max=-128,total=0,zc=0;
+      for (let j=0;j<raw.length;j++) {
+        const v = raw[j]>127 ? raw[j]-256 : raw[j];
+        if (v<min) min=v; if (v>max) max=v; total+=v;
+        if (j>0 && ((raw[j]>=128)!==(raw[j-1]>=128)||(raw[j]==128)!==(raw[j-1]==128))) zc++;
+      }
+      ins.sampleMin = min; ins.sampleMax = max;
+      ins.sampleMean = raw.length>0 ? total/raw.length : 0;
+      ins.sampleRange = max-min;
+      ins.sampleZeroCross = zc;
+      ins.estCycles = raw.length>0 ? zc/2 : 0;
+    }
+    sampleOff += ins.length;
+  }
+
+  return { name, songLength, positions, marker, numChannels, instruments, patterns, issues,
+    totalSize: bytes.length, sampleDataStart: off-numPatterns*patternSize, off };
+}
+
+function analyze(mod) {
+  const issues = [...mod.issues];
+  let totalNotes=0, totalEffects=0;
+  for (const p of mod.patterns) {
+    const n = p.channelCounts.reduce((a,b)=>a+b,0);
+    totalNotes += n;
+    totalEffects += p.channelEffects.reduce((a,b)=>a+b,0);
+  }
+
+  // silent patterns
+  for (const p of mod.patterns) {
+    const n = p.channelCounts.reduce((a,b)=>a+b,0);
+    if (n===0) issues.push({sev:'error',text:'Pattern '+p.index+' is completely silent (0 notes)'});
+    else if (n < 4) issues.push({sev:'info',text:'Pattern '+p.index+' has only '+n+' note(s) — very sparse'});
+  }
+
+  // sample issues
+  for (const ins of mod.instruments) {
+    if (ins.length===0) continue;
+    if (ins.sampleRange===0) issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') sample is flat (range=0) — will produce silence'});
+    else if (ins.sampleRange < 3) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') sample range is only '+ins.sampleRange+' — near-silent'});
+    if (ins.volume===0) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has volume 0'});
+    if (ins.estCycles < 2 && ins.length > 0) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has ~'+ins.estCycles.toFixed(1)+' cycles — may be below audible range'});
+  }
+
+  // period / note distribution
+  const allPeriods = [];
+  for (const p of mod.patterns) for (const n of p.notes) if (n.period>0) allPeriods.push(n.period);
+  const periodHist = {};
+  for (const p of allPeriods) { periodHist[p]=(periodHist[p]||0)+1; }
+  const sortedPeriods = Object.entries(periodHist).sort((a,b)=>b[1]-a[1]);
+
+  // effect usage
+  const effectCounts = {};
+  for (const p of mod.patterns) for (const n of p.notes) {
+    if (n.effect>0) effectCounts[n.effect]=(effectCounts[n.effect]||0)+1;
+  }
+
+  return { issues, totalNotes, totalEffects, sortedPeriods, effectCounts, allPeriods };
+}
+
+// ============================================================
+// Render
+// ============================================================
+
+function renderReport(mod, analysis) {
+  const report = document.getElementById('report');
+  report.classList.remove('hidden');
+  let html = '';
+
+  // overview
+  html += '<div class="section"><h2>overview</h2><div class="kv">';
+  html += kv('name', mod.name);
+  html += kv('marker', mod.marker+' ('+mod.numChannels+' channels)');
+  html += kv('song length', mod.songLength+' positions');
+  html += kv('file size', mod.totalSize+' bytes');
+  html += kv('instruments', mod.instruments.filter(i=>i.length>0).length+' / 31 used');
+  html += kv('patterns', mod.patterns.length);
+  html += kv('total notes', analysis.totalNotes);
+  html += kv('total effects', analysis.totalEffects);
+  html += '</div></div>';
+
+  // pattern sequence
+  html += '<div class="section"><h2>pattern sequence</h2>';
+  html += '<div style="display:flex;flex-wrap:wrap;gap:4px;font-size:.75rem;font-family:monospace">';
+  for (let i=0;i<Math.min(mod.songLength,64);i++) {
+    const p = mod.positions[i];
+    const noteCount = p<mod.patterns.length ? mod.patterns[p].channelCounts.reduce((a,b)=>a+b,0) : 0;
+    const hue = noteCount===0?'#f85149':noteCount<10?'#d29922':'#3fb950';
+    html += '<span style="background:#21262d;padding:2px 6px;border-radius:3px" title="pattern '+p+': '+noteCount+' notes">';
+    html += '<span style="color:'+hue+'">'+p.toString().padStart(2,'0')+'</span></span>';
+  }
+  if (mod.songLength > 64) html += ' <span style="color:#8b949e">+'+ (mod.songLength-64)+' more</span>';
+  html += '</div></div>';
+
+  // pattern density
+  html += '<div class="section"><h2>pattern density</h2>';
+  html += '<table><thead><tr><th>pattern</th>';
+  for (let ch=0;ch<mod.numChannels;ch++) html += '<th>ch'+ch+'</th>';
+  html += '<th>total</th><th>density</th></tr></thead><tbody>';
+  for (const p of mod.patterns.slice(0,32)) {
+    const total = p.channelCounts.reduce((a,b)=>a+b,0);
+    const maxNotes = 64*mod.numChannels;
+    const pct = Math.round(total/maxNotes*100);
+    html += '<tr><td>'+p.index.toString().padStart(2,'0')+'</td>';
+    for (let ch=0;ch<4;ch++) {
+      const c = p.channelCounts[ch]||0;
+      const hue = c===0?'#484f58':c<4?'#d29922':'#c9d1d9';
+      html += '<td style="color:'+hue+'">'+c+'</td>';
+    }
+    html += '<td><strong>'+total+'</strong></td>';
+    html += '<td><span style="color:'+(pct>=10?'#3fb950':pct>0?'#d29922':'#f85149')+'">'+pct+'%</span>';
+    html += '<div class="bar"><div class="bar-fill" style="width:'+pct+'%;background:'+(pct>=25?'#3fb950':pct>=10?'#d29922':'#f85149')+'"></div></div></td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+
+  // instruments
+  html += '<div class="section"><h2>instruments</h2>';
+  html += '<table><thead><tr><th>#</th><th>name</th><th>size</th><th>volume</th><th>range</th><th>cycles</th><th>loop</th></tr></thead><tbody>';
+  for (const ins of mod.instruments) {
+    if (ins.length===0) continue;
+    html += '<tr><td>'+ins.index+'</td><td>'+esc(ins.name||'(unnamed)')+'</td>';
+    html += '<td>'+ins.length+'</td>';
+    html += '<td>'+ins.volume+'</td>';
+    html += '<td>'+ins.sampleRange+'</td>';
+    html += '<td style="color:'+(ins.estCycles<2?'#f85149':'#c9d1d9')+'">'+(ins.estCycles!=null?ins.estCycles.toFixed(1):'—')+'</td>';
+    html += '<td>'+(ins.loopLength>0?ins.loopStart+'→'+(ins.loopStart+ins.loopLength):'—')+'</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+
+  // note distribution
+  if (analysis.sortedPeriods.length>0) {
+    html += '<div class="section"><h2>notes used (top 12)</h2>';
+    html += '<table><thead><tr><th>period</th><th>note</th><th>count</th></tr></thead><tbody>';
+    for (const [period,count] of analysis.sortedPeriods.slice(0,12)) {
+      html += '<tr><td>'+period+'</td><td>'+noteName(parseInt(period))+'</td><td>'+count+'</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  // effects
+  if (Object.keys(analysis.effectCounts).length>0) {
+    html += '<div class="section"><h2>effects used</h2>';
+    html += '<table><thead><tr><th>effect</th><th>name</th><th>count</th></tr></thead><tbody>';
+    const sortedFx = Object.entries(analysis.effectCounts).sort((a,b)=>b[1]-a[1]);
+    for (const [fx,count] of sortedFx) {
+      const fxNum = parseInt(fx);
+      html += '<tr><td>'+fxNum.toString(16).toUpperCase()+'</td><td>'+ (EFFECT_NAMES[fxNum]||'?') +'</td><td>'+count+'</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  // issues
+  html += '<div class="section"><h2>issues ('+analysis.issues.length+')</h2>';
+  if (analysis.issues.length===0) {
+    html += '<p class="ok">no issues found — this .mod file looks healthy</p>';
+  } else {
+    for (const iss of analysis.issues) {
+      const cls = iss.sev==='error'?'issue':iss.sev==='warn'?'issue warn':'issue info';
+      html += '<div class="'+cls+'"><strong>'+iss.sev.toUpperCase()+'</strong> '+esc(iss.text)+'</div>';
+    }
+  }
+  html += '</div>';
+
+  report.innerHTML = html;
+}
+
+function kv(k,v) { return '<div><dt>'+esc(k)+'</dt><dd>'+esc(String(v))+'</dd></div>'; }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ============================================================
+// UI
+// ============================================================
+
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click',()=>fileInput.click());
+dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('drag')});
+dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('drag'));
+dropZone.addEventListener('drop',e=>{
+  e.preventDefault();
+  dropZone.classList.remove('drag');
+  if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change',()=>{
+  if (fileInput.files.length) processFile(fileInput.files[0]);
+});
+
+function processFile(file) {
+  if (!file.name.match(/\.mod$/i)) {
+    alert('not a .mod file. please drop a .mod tracker module.');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = function() {
+    const bytes = new Uint8Array(reader.result);
+    try {
+      const mod = parseMod(bytes);
+      const analysis = analyze(mod);
+      renderReport(mod, analysis);
+    } catch(e) {
+      document.getElementById('report').classList.remove('hidden');
+      document.getElementById('report').innerHTML =
+        '<div class="section"><h2>error</h2><div class="issue">Failed to parse .mod file: '+esc(e.message)+'</div></div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+</script>
+</body>
+</html>
