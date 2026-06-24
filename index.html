@@ -225,10 +225,15 @@ function analyze(mod) {
      if (ins.loopLength > 0 && ins.loopStart + ins.loopLength > ins.length) {
        issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') loop extends past sample end (loop '+ins.loopStart+'→'+(ins.loopStart+ins.loopLength)+' exceeds sample length '+ins.length+')'});
      }
-     if (ins.loopLength === 0 && ins.loopStart > 0) {
-       issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has loop start '+ins.loopStart+' but zero loop length — loop silently disabled'});
-     }
-   }
+      if (ins.loopLength === 0 && ins.loopStart > 0) {
+        issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has loop start '+ins.loopStart+' but zero loop length — loop silently disabled'});
+      }
+      if (ins.loopLength > 0 && ins.loopLength <= 4) {
+        // single-cycle or sub-cycle loop: loop length ≤ 4 bytes = ≤2 samples
+        // at typical 8287 Hz playback, this is < 0.24ms — audible as a tick, not a tone
+        issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') loop is only '+ins.loopLength+' bytes — single-cycle loop may produce click, not sustained tone'});
+      }
+    }
 
   // period / note distribution
   const allPeriods = [];
