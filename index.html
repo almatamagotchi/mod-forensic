@@ -147,27 +147,41 @@ function parseMod(bytes) {
     patterns.push(pat);
   }
 
-  // sample data
-  let sampleOff = off;
-  for (const ins of instruments) {
-    ins.sampleOff = sampleOff;
-    if (ins.length > 0 && sampleOff+ins.length <= bytes.length) {
-      const raw = bytes.slice(sampleOff, sampleOff+ins.length);
-      ins.sampleData = raw;
-      let min=127,max=-128,total=0,zc=0;
-      for (let j=0;j<raw.length;j++) {
-        const v = raw[j]>127 ? raw[j]-256 : raw[j];
-        if (v<min) min=v; if (v>max) max=v; total+=v;
-        if (j>0 && ((raw[j]>=128)!==(raw[j-1]>=128)||(raw[j]==128)!==(raw[j-1]==128))) zc++;
-      }
-      ins.sampleMin = min; ins.sampleMax = max;
-      ins.sampleMean = raw.length>0 ? total/raw.length : 0;
-      ins.sampleRange = max-min;
-      ins.sampleZeroCross = zc;
-      ins.estCycles = raw.length>0 ? zc/2 : 0;
-    }
-    sampleOff += ins.length;
-  }
+   // sample data
+   let sampleOff = off;
+   for (const ins of instruments) {
+     ins.sampleOff = sampleOff;
+     if (ins.length > 0 && sampleOff+ins.length <= bytes.length) {
+       const raw = bytes.slice(sampleOff, sampleOff+ins.length);
+       ins.sampleData = raw;
+       let min=127,max=-128,total=0,zc=0;
+       let zeroCount=0, silentCount=0;
+       for (let j=0;j<raw.length;j++) {
+         const v = raw[j]>127 ? raw[j]-256 : raw[j];
+         if (v<min) min=v; if (v>max) max=v; total+=v;
+         if (j>0 && ((raw[j]>=128)!==(raw[j-1]>=128)||(raw[j]==128)!==(raw[j-1]==128))) zc++;
+         if (raw[j]===0 || raw[j]===128) zeroCount++;
+         if (raw[j]===0 || raw[j]===1 || raw[j]===127 || raw[j]===128 || raw[j]===129 || raw[j]===255) silentCount++;
+       }
+       ins.sampleMin = min; ins.sampleMax = max;
+       ins.sampleMean = raw.length>0 ? total/raw.length : 0;
+       ins.sampleRange = max-min;
+       ins.sampleZeroCross = zc;
+       ins.estCycles = raw.length>0 ? zc/2 : 0;
+       ins.zeroFillPct = raw.length>0 ? zeroCount/raw.length*100 : 0;
+       ins.silentFillPct = raw.length>0 ? silentCount/raw.length*100 : 0;
+     } else if (ins.length > 0) {
+       // Sample data extends past end of file — truncated
+       ins.sampleData = null;
+       ins.sampleMin = 0; ins.sampleMax = 0;
+       ins.sampleMean = 0; ins.sampleRange = 0;
+       ins.sampleZeroCross = 0; ins.estCycles = 0;
+       ins.zeroFillPct = 100;
+       ins.silentFillPct = 100;
+       ins.truncated = true;
+     }
+     sampleOff += ins.length;
+   }
 
   return { name, songLength, positions, marker, numChannels, instruments, patterns, issues,
     totalSize: bytes.length, sampleDataStart: off-numPatterns*patternSize, off };
@@ -189,14 +203,32 @@ function analyze(mod) {
     else if (n < 4) issues.push({sev:'info',text:'Pattern '+p.index+' has only '+n+' note(s) — very sparse'});
   }
 
-  // sample issues
-  for (const ins of mod.instruments) {
-    if (ins.length===0) continue;
-    if (ins.sampleRange===0) issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') sample is flat (range=0) — will produce silence'});
-    else if (ins.sampleRange < 3) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') sample range is only '+ins.sampleRange+' — near-silent'});
-    if (ins.volume===0) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has volume 0'});
-    if (ins.estCycles < 2 && ins.length > 0) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has ~'+ins.estCycles.toFixed(1)+' cycles — may be below audible range'});
-  }
+   // sample issues
+   for (const ins of mod.instruments) {
+     if (ins.length===0) continue;
+     if (ins.truncated) {
+       issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') sample is truncated — file ends before sample data at offset '+ins.sampleOff+' (expected '+ins.length+' bytes)'});
+       continue;
+     }
+     if (ins.sampleRange===0 && ins.zeroFillPct > 90) {
+       issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') sample is zero-filled ('+(ins.zeroFillPct).toFixed(0)+'% zeros) — will produce complete silence'});
+     } else if (ins.sampleRange===0) {
+       issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') sample is flat (range=0) — will produce silence'});
+     } else if (ins.sampleRange < 3) {
+       issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') sample range is only '+ins.sampleRange+' — near-silent'});
+     }
+     if (ins.silentFillPct > 50 && ins.sampleRange > 0) {
+       issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') sample is '+(ins.silentFillPct).toFixed(0)+'% near-silent values (0,1,127-129,255)'});
+     }
+     if (ins.volume===0) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has volume 0'});
+     if (ins.estCycles < 2 && ins.length > 0) issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has ~'+ins.estCycles.toFixed(1)+' cycles — may be below audible range'});
+     if (ins.loopLength > 0 && ins.loopStart + ins.loopLength > ins.length) {
+       issues.push({sev:'error',text:'Instrument '+ins.index+' ('+ins.name+') loop extends past sample end (loop '+ins.loopStart+'→'+(ins.loopStart+ins.loopLength)+' exceeds sample length '+ins.length+')'});
+     }
+     if (ins.loopLength === 0 && ins.loopStart > 0) {
+       issues.push({sev:'warn',text:'Instrument '+ins.index+' ('+ins.name+') has loop start '+ins.loopStart+' but zero loop length — loop silently disabled'});
+     }
+   }
 
   // period / note distribution
   const allPeriods = [];
@@ -270,20 +302,26 @@ function renderReport(mod, analysis) {
   }
   html += '</tbody></table></div>';
 
-  // instruments
-  html += '<div class="section"><h2>instruments</h2>';
-  html += '<table><thead><tr><th>#</th><th>name</th><th>size</th><th>volume</th><th>range</th><th>cycles</th><th>loop</th></tr></thead><tbody>';
-  for (const ins of mod.instruments) {
-    if (ins.length===0) continue;
-    html += '<tr><td>'+ins.index+'</td><td>'+esc(ins.name||'(unnamed)')+'</td>';
-    html += '<td>'+ins.length+'</td>';
-    html += '<td>'+ins.volume+'</td>';
-    html += '<td>'+ins.sampleRange+'</td>';
-    html += '<td style="color:'+(ins.estCycles<2?'#f85149':'#c9d1d9')+'">'+(ins.estCycles!=null?ins.estCycles.toFixed(1):'—')+'</td>';
-    html += '<td>'+(ins.loopLength>0?ins.loopStart+'→'+(ins.loopStart+ins.loopLength):'—')+'</td>';
-    html += '</tr>';
-  }
-  html += '</tbody></table></div>';
+   // instruments
+   html += '<div class="section"><h2>instruments</h2>';
+   html += '<table><thead><tr><th>#</th><th>name</th><th>size</th><th>vol</th><th>range</th><th>cycles</th><th>zero%</th><th>loop</th></tr></thead><tbody>';
+   for (const ins of mod.instruments) {
+     if (ins.length===0) continue;
+     html += '<tr><td>'+ins.index+'</td><td>'+esc(ins.name||'(unnamed)')+'</td>';
+     html += '<td>'+ins.length+'</td>';
+     html += '<td>'+ins.volume+'</td>';
+     if (ins.truncated) {
+       html += '<td style="color:#f85149" colspan="3">truncated — file ends at offset '+ins.sampleOff+'</td>';
+     } else {
+       html += '<td>'+ins.sampleRange+'</td>';
+       html += '<td style="color:'+(ins.estCycles<2?'#f85149':'#c9d1d9')+'">'+(ins.estCycles!=null?ins.estCycles.toFixed(1):'—')+'</td>';
+       const zfp = ins.zeroFillPct||0;
+       html += '<td style="color:'+(zfp>50?'#f85149':zfp>10?'#d29922':'#c9d1d9')+'">'+zfp.toFixed(1)+'%</td>';
+     }
+     html += '<td>'+(ins.loopLength>0?ins.loopStart+'→'+(ins.loopStart+ins.loopLength):'—')+'</td>';
+     html += '</tr>';
+   }
+   html += '</tbody></table></div>';
 
   // note distribution
   if (analysis.sortedPeriods.length>0) {
